@@ -8,6 +8,7 @@ from fastapi import BackgroundTasks, HTTPException, status
 from pymongo import ReturnDocument
 from pymongo.errors import ConnectionFailure, DuplicateKeyError
 
+from app.database.organizations import Organizations
 from app.models.users import UserBaseModel
 from app.schemas.users import (
     UserLoginRequestSchema,
@@ -21,7 +22,7 @@ from app.utils.database import MongoDBConnector
 from app.utils.hashing import Hasher
 from app.utils.jwt_handler import JwtTokenHandler
 from app.utils.responses import OK, Created
-from app.utils.validators import validate_db_connection
+from app.utils.validators import validate_db_connection, validate_object_id_fields
 
 
 class Users:
@@ -30,11 +31,15 @@ class Users:
     hasher: Hasher
     jwt: JwtTokenHandler
 
+    organizations: str = "Organizations"
+
+    # Sync db
+    db_sync = MongoDBConnector = None
+
     @classmethod
     def __init__(cls) -> None:
         cls.hasher = Hasher()
         cls.jwt = JwtTokenHandler()
-        cls.email_service = email_service
 
     @classmethod
     def _set_expires(cls):
@@ -49,6 +54,14 @@ class Users:
         validate_db_connection(cls.db)
 
     @classmethod
+    def __initiate_db_sync(cls):
+        if cls.db_sync is not None:
+            return cls.db_sync
+
+        cls.db_sync = MongoDBConnector().connect_sync()
+        validate_db_connection(cls.db)
+
+    @classmethod
     async def register_user(
         cls, background_tasks: BackgroundTasks, user_details: UserRegisterRequestSchema
     ):
@@ -57,16 +70,27 @@ class Users:
         try:
             user = await cls.db[cls.name].find_one({"email": user_details.email})
             if user:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="User already exists",
+                raise Exception(
+                    {
+                        "status_code": status.HTTP_400_BAD_REQUEST,
+                        "detail": "Error: User already exists",
+                    }
                 )
 
         except ConnectionFailure:
-            raise HTTPException(
+            raise Exception(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Database connection error",
+                detail="Error: Database connection error",
             )
+
+        except Exception as e:
+            status_code, detail = e.args[0].get("status_code", 400), e.args[0].get(
+                "detail", "Error: Bad Request"
+            )
+            raise HTTPException(
+                status_code=status_code,
+                detail=detail,
+            ) from e
 
         otp = cls.hasher.get_otp()
         expiry = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
@@ -81,7 +105,7 @@ class Users:
 
         try:
             background_tasks.add_task(
-                cls.email_service.send_otp,
+                email_service.send_otp,
                 user_details.email,
                 "OptySys User Verfication",
                 otp,
@@ -97,14 +121,14 @@ class Users:
         except ConnectionFailure:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Database connection error",
+                detail="Error: Database connection error",
             )
 
         except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Error: Bad request {e}",
-            )
+                detail=f"Error: Bad request",
+            ) from e
 
         finally:
             await MongoDBConnector().close()
@@ -122,21 +146,24 @@ class Users:
             payload_data = cls.jwt.decode(token)
 
         except Exception as e:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Error: {e}",
+            status_code, detail = e.args[0].get("status_code", 400), e.args[0].get(
+                "detail", "Error: Bad Request"
             )
+            raise HTTPException(
+                status_code=status_code,
+                detail=detail,
+            ) from e
 
         if payload_data["otp"] != otp:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid OTP",
+                detail="Error: Invalid OTP",
             )
 
         if payload_data["email"] != user_details.email:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid email",
+                detail="Error: Invalid email",
             )
 
         hashed_password = cls.hasher.get_password_hash(user_details.password)
@@ -166,19 +193,19 @@ class Users:
         except DuplicateKeyError:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="User already exists",
+                detail="Error: User already exists",
             )
 
         except ConnectionFailure:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Database connection error",
+                detail="Error: Database connection error",
             )
 
         except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Error: Bad request{e}",
+                detail=f"Error: Bad request",
             )
 
         finally:
@@ -192,15 +219,19 @@ class Users:
             user = await cls.db[cls.name].find_one({"email": user_details.email})
 
             if user is None:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="User not found",
+                raise Exception(
+                    {
+                        "status_code": status.HTTP_404_NOT_FOUND,
+                        "detail": "Error: User not found",
+                    }
                 )
 
             if not cls.hasher.verify_password(user_details.password, user["password"]):
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Incorrect password",
+                raise Exception(
+                    {
+                        "status_code": status.HTTP_401_UNAUTHORIZED,
+                        "detail": "Error: Incorrect password",
+                    }
                 )
 
             response = UserResponseSchema(user).response()
@@ -221,14 +252,16 @@ class Users:
         except ConnectionFailure:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Database connection error",
+                detail="Error: Database connection error",
             )
 
         except Exception as e:
-            print(e)
+            status_code, detail = e.args[0].get("status_code", 400), e.args[0].get(
+                "detail", "Error: Bad Request"
+            )
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Error: User not found",
+                status_code=status_code,
+                detail=detail,
             ) from e
 
         finally:
@@ -254,25 +287,30 @@ class Users:
             )
 
             if user is None:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Unable to update user",
+                raise Exception(
+                    {
+                        "status_code": status.HTTP_404_NOT_FOUND,
+                        "detail": "Error: User not found",
+                    }
                 )
 
             response = UserResponseSchema(user).response()
 
             return OK(response)
+
         except ConnectionFailure:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Database connection error",
+                detail="Error: Database connection error",
             )
 
         except Exception as e:
-            print(e)
+            status_code, detail = e.args[0].get("status_code", 400), e.args[0].get(
+                "detail", "Error: Bad Request"
+            )
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Error: User not found",
+                status_code=status_code,
+                detail=detail,
             ) from e
 
         finally:
@@ -286,9 +324,11 @@ class Users:
             user = await cls.db[cls.name].find_one({"_id": user_id})
 
             if user is None:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="User not found",
+                raise Exception(
+                    {
+                        "status_code": status.HTTP_404_NOT_FOUND,
+                        "detail": "Error: User not found",
+                    }
                 )
 
             response = UserResponseSchema(user).response()
@@ -298,14 +338,11 @@ class Users:
         except ConnectionFailure:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Database connection error",
+                detail="Error: Database connection error",
             )
 
         except Exception as e:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Error: User not found",
-            ) from e
+            raise e
 
         finally:
             await MongoDBConnector().close()
@@ -316,25 +353,104 @@ class Users:
             user = await cls._get_user_by_id(user_id)
 
             if user is None:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="User not found",
+                raise Exception(
+                    {
+                        "status_code": status.HTTP_404_NOT_FOUND,
+                        "detail": "Error: User not found",
+                    }
                 )
 
             if not bool(user["activated"]):
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="User not activated",
+                raise Exception(
+                    {
+                        "status_code": status.HTTP_401_UNAUTHORIZED,
+                        "detail": "Error: User not activated",
+                    }
                 )
 
         except ConnectionFailure:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Database connection error",
+                detail="Error: Database connection error",
             )
 
         except Exception as e:
+            raise e
+
+    @classmethod
+    async def delete_user(cls, user_id):
+        await cls.__initiate_db()
+
+        validate_object_id_fields(user_id)
+
+        try:
+            session = await cls.db.client.start_session()
+            async with session.start_transaction():
+                user = await cls.db[cls.name].find_one(
+                    {"_id": user_id},
+                    projection={"organizations": 1},
+                    session=session,
+                )
+
+                if user is None:
+                    raise Exception(
+                        {
+                            "status_code": status.HTTP_404_NOT_FOUND,
+                            "detail": "Error: User not found",
+                        }
+                    )
+
+                # Delete all organizations created by the user, if any and remove user from all organizations as a member or admin
+                organizations = user["organizations"]
+
+                org = Organizations()
+
+                for organization in organizations:
+                    try:
+                        await org.remove_member(user_id, organization, user_id)
+
+                    except Exception as e:
+                        raise e
+
+                # Sync user deletion
+                cls.__initiate_db_sync()
+
+                res = cls.db_sync[cls.name].delete_one({"_id": user_id})
+
+                if res.deleted_count == 0:
+                    raise Exception(
+                        {
+                            "status_code": status.HTTP_404_NOT_FOUND,
+                            "detail": "Error: User not found",
+                        }
+                    )
+
+                # Remove cookies and logout user
+                response = OK(
+                    {
+                        "detail": "Success: User deleted successfully.",
+                    }
+                )
+
+                response.delete_cookie(key="access_token")
+
+                return response
+
+        except ConnectionFailure:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Error: User not found",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Error: Database connection error",
+            )
+
+        except Exception as e:
+            status_code, detail = e.args[0].get("status_code", 400), e.args[0].get(
+                "detail", "Error: Bad Request"
+            )
+            raise HTTPException(
+                status_code=status_code,
+                detail=detail,
             ) from e
+
+        finally:
+            session.end_session()
+            await MongoDBConnector().close()

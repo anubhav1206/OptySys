@@ -11,7 +11,7 @@ from app.schemas.users import (
 )
 
 router = APIRouter(
-    tags=["Organizations"],
+    tags=["Authentication"],
     prefix="/auth",
 )
 
@@ -24,7 +24,7 @@ router = APIRouter(
         HTTPException: Bad request error
 
     Returns:
-        _type_: OTP for email verification
+        _type_: Dict of email and token
 """
 
 
